@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Sidor Avoda Maor — Task & Calendar Sync
-Reads pending Telegram messages, parses with GPT-4o,
-writes to Google Calendar via Service Account, sends Hebrew summary.
+- tasks  → Google Tasks
+- events → Google Calendar
 Runs twice daily via GitHub Actions (10:00 & 22:00 Israel time).
 """
 
@@ -14,36 +14,33 @@ from datetime import datetime, timedelta
 import pytz
 import requests
 from openai import OpenAI
-from google.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials as SACredentials
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("task_sync")
 
-ISRAEL_TZ = pytz.timezone("Asia/Jerusalem")
-BOT_TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-OPENAI_API_KEY = os.environ["OPEN_API_KEY"]
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+ISRAEL_TZ   = pytz.timezone("Asia/Jerusalem")
+BOT_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID     = os.environ["CHAT_ID"]
+CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "maorfurman123@gmail.com")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+openai_client = OpenAI(api_key=os.environ["OPEN_API_KEY"])
+TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 PARSE_PROMPT = """You are a Hebrew personal assistant. The user sent you a message in Hebrew.
 Today is {today} (DD/MM/YYYY). Current time (Israel): {time}.
 
-The message may contain ONE or MULTIPLE tasks/events (separated by newlines or listed together).
-Extract ALL actionable items from the message.
+The message may contain ONE or MULTIPLE tasks/events.
+Extract ALL actionable items.
 
-Rules per item:
-- "task" = something to do without a specific time (e.g. "לקנות חלב")
-  → date = today unless "מחר" (tomorrow) or a specific date is mentioned
-  → start_time = null, end_time = null
-- "event" = has a specific time (e.g. "אימון בשעה 6 בבוקר")
-  → extract date and time precisely; if no end time, assume 1 hour
-- "ignore" = greeting, question, or not actionable
+Rules:
+- "task" = to-do without a specific time → date = today unless "מחר"/specific date mentioned
+- "event" = has a specific time → extract date+time; assume 1hr if no end time
+- "ignore" = greeting, question, command, or not actionable
 
-Respond with ONLY a valid JSON array (even for a single item):
+Return ONLY a valid JSON array:
 [
   {{
     "type": "task|event|ignore",
@@ -62,35 +59,26 @@ Message:
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
 def get_pending_updates() -> list[dict]:
-    resp = requests.get(
-        f"{TELEGRAM_API}/getUpdates",
-        params={"limit": 100, "timeout": 0},
-        timeout=15,
-    )
+    resp = requests.get(f"{TELEGRAM_API}/getUpdates",
+                        params={"limit": 100, "timeout": 0}, timeout=15)
     resp.raise_for_status()
     return resp.json().get("result", [])
 
 
-def acknowledge_updates(last_update_id: int):
-    requests.get(
-        f"{TELEGRAM_API}/getUpdates",
-        params={"offset": last_update_id + 1, "limit": 1, "timeout": 0},
-        timeout=15,
-    )
+def acknowledge_updates(last_id: int):
+    requests.get(f"{TELEGRAM_API}/getUpdates",
+                 params={"offset": last_id + 1, "limit": 1, "timeout": 0}, timeout=15)
 
 
 def send_telegram(text: str):
-    requests.post(
-        f"{TELEGRAM_API}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-        timeout=15,
-    ).raise_for_status()
+    requests.post(f"{TELEGRAM_API}/sendMessage",
+                  json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+                  timeout=15).raise_for_status()
 
 
 # ── GPT-4o Parsing ────────────────────────────────────────────────────────────
 
 def parse_message(text: str) -> list[dict]:
-    """Returns a list of parsed items from a single Telegram message."""
     now = datetime.now(ISRAEL_TZ)
     prompt = PARSE_PROMPT.format(
         today=now.strftime("%d/%m/%Y"),
@@ -109,11 +97,11 @@ def parse_message(text: str) -> list[dict]:
     return result if isinstance(result, list) else [result]
 
 
-# ── Google Calendar ───────────────────────────────────────────────────────────
+# ── Google Calendar (Service Account) ────────────────────────────────────────
 
-def _get_calendar_service():
-    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    creds = Credentials.from_service_account_info(
+def _calendar_service():
+    info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    creds = SACredentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/calendar"]
     )
     return build("calendar", "v3", credentials=creds)
@@ -123,47 +111,55 @@ def _parse_date(date_str: str) -> str:
     parts = date_str.split("/")
     day, month = parts[0], parts[1]
     year = parts[2] if len(parts) == 3 else str(datetime.now().year)
-    if len(year) == 2:
-        year = "20" + year
-    return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+    return f"{'20'+year if len(year)==2 else year}-{month.zfill(2)}-{day.zfill(2)}"
 
 
-def add_to_calendar(parsed: dict) -> str:
-    service = _get_calendar_service()
+def add_calendar_event(parsed: dict) -> str:
+    service = _calendar_service()
     date_iso = _parse_date(parsed["date"])
+    start_dt = ISRAEL_TZ.localize(
+        datetime.strptime(f"{date_iso} {parsed['start_time']}", "%Y-%m-%d %H:%M")
+    )
+    end_dt = (
+        ISRAEL_TZ.localize(datetime.strptime(f"{date_iso} {parsed['end_time']}", "%Y-%m-%d %H:%M"))
+        if parsed.get("end_time")
+        else start_dt + timedelta(hours=1)
+    )
+    event_body = {
+        "summary": f"📅 {parsed['title']}",
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Jerusalem"},
+        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Asia/Jerusalem"},
+        "reminders": {"useDefault": False,
+                      "overrides": [{"method": "popup", "minutes": 30}]},
+    }
+    service.events().insert(calendarId=CALENDAR_ID, body=event_body).execute()
+    return f"{parsed['date']} {parsed['start_time']}–{end_dt.strftime('%H:%M')}"
 
-    if parsed["type"] == "task" or not parsed.get("start_time"):
-        event_body = {
-            "summary": f"📌 {parsed['title']}",
-            "description": parsed.get("notes", ""),
-            "start": {"date": date_iso},
-            "end": {"date": date_iso},
-        }
-        return f"{parsed['date']} — כל היום"
-    else:
-        start_dt = ISRAEL_TZ.localize(
-            datetime.strptime(f"{date_iso} {parsed['start_time']}", "%Y-%m-%d %H:%M")
-        )
-        if parsed.get("end_time"):
-            end_dt = ISRAEL_TZ.localize(
-                datetime.strptime(f"{date_iso} {parsed['end_time']}", "%Y-%m-%d %H:%M")
-            )
-        else:
-            end_dt = start_dt + timedelta(hours=1)
 
-        event_body = {
-            "summary": f"📅 {parsed['title']}",
-            "description": parsed.get("notes", ""),
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Jerusalem"},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Jerusalem"},
-            "reminders": {
-                "useDefault": False,
-                "overrides": [{"method": "popup", "minutes": 30}],
-            },
-        }
-        return f"{parsed['date']} {parsed['start_time']}–{end_dt.strftime('%H:%M')}"
+# ── Google Tasks (OAuth2) ─────────────────────────────────────────────────────
 
-    service.events().insert(calendarId="primary", body=event_body).execute()
+def _tasks_service():
+    creds = OAuthCredentials(
+        token=None,
+        refresh_token=os.environ["GOOGLE_TASKS_REFRESH_TOKEN"],
+        client_id=os.environ["GOOGLE_CLIENT_ID"],
+        client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=["https://www.googleapis.com/auth/tasks"],
+    )
+    return build("tasks", "v1", credentials=creds)
+
+
+def add_task(parsed: dict) -> str:
+    service = _tasks_service()
+    date_iso = _parse_date(parsed["date"])
+    due_rfc = f"{date_iso}T00:00:00.000Z"
+    task_body = {
+        "title": parsed["title"],
+        "due": due_rfc,
+    }
+    service.tasks().insert(tasklist="@default", body=task_body).execute()
+    return f"{parsed['date']} — Google Tasks"
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -193,66 +189,34 @@ def main():
             items = parse_message(text)
         except Exception as e:
             logger.error(f"Parse failed: {e}")
-            failed.append(f'• "{text[:40]}" — שגיאת ניתוח: {e}')
+            failed.append(f'• "{text[:40]}" — שגיאת ניתוח')
             continue
 
         for parsed in items:
             if parsed.get("type") == "ignore":
-                ignored.append(parsed.get("title", text))
                 continue
             try:
-                service = _get_calendar_service()
-                date_iso = _parse_date(parsed["date"])
-
-                if parsed["type"] == "task" or not parsed.get("start_time"):
-                    event_body = {
-                        "summary": f"📌 {parsed['title']}",
-                        "start": {"date": date_iso},
-                        "end": {"date": date_iso},
-                    }
-                    when = f"{parsed['date']} — כל היום"
-                    icon = "📌"
+                if parsed["type"] == "task":
+                    when = add_task(parsed)
+                    added.append(f'✅ "{parsed["title"]}" — {when}')
+                    logger.info(f"Task added: {parsed['title']}")
                 else:
-                    start_dt = ISRAEL_TZ.localize(
-                        datetime.strptime(f"{date_iso} {parsed['start_time']}", "%Y-%m-%d %H:%M")
-                    )
-                    end_dt = (
-                        ISRAEL_TZ.localize(
-                            datetime.strptime(f"{date_iso} {parsed['end_time']}", "%Y-%m-%d %H:%M")
-                        )
-                        if parsed.get("end_time")
-                        else start_dt + timedelta(hours=1)
-                    )
-                    event_body = {
-                        "summary": f"📅 {parsed['title']}",
-                        "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Jerusalem"},
-                        "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Jerusalem"},
-                        "reminders": {
-                            "useDefault": False,
-                            "overrides": [{"method": "popup", "minutes": 30}],
-                        },
-                    }
-                    when = f"{parsed['date']} {parsed['start_time']}–{end_dt.strftime('%H:%M')}"
-                    icon = "📅"
-
-                service.events().insert(calendarId=os.environ.get("GOOGLE_CALENDAR_ID", "primary"), body=event_body).execute()
-                added.append(f'{icon} "{parsed["title"]}" — {when}')
-                logger.info(f"Added: {parsed['title']}")
-
+                    when = add_calendar_event(parsed)
+                    added.append(f'📅 "{parsed["title"]}" — {when}')
+                    logger.info(f"Event added: {parsed['title']}")
             except Exception as e:
-                logger.error(f"Calendar insert failed for {parsed.get('title')}: {e}")
-                failed.append(f'• "{parsed.get("title", "?")}": {str(e)[:80]}')
+                logger.error(f"Failed {parsed.get('title')}: {e}")
+                failed.append(f'• "{parsed.get("title","?")}" — {str(e)[:80]}')
 
     acknowledge_updates(updates[-1]["update_id"])
 
     total = len(messages) - len(ignored)
     lines = [f"✅ <b>עיבדתי {total} הודעות:</b>\n"]
-
     if added:
-        lines.append("➕ <b>נוספו ליומן:</b>")
+        lines.append("➕ <b>נוספו:</b>")
         lines.extend(added)
     if failed:
-        lines.append("\n⚠️ <b>לא הצלחתי לעבד:</b>")
+        lines.append("\n⚠️ <b>נכשל:</b>")
         lines.extend(failed)
     if not added and not failed:
         lines.append("לא היו הודעות לעיבוד.")
