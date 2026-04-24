@@ -32,28 +32,30 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 PARSE_PROMPT = """You are a Hebrew personal assistant. The user sent you a message in Hebrew.
 Today is {today} (DD/MM/YYYY). Current time (Israel): {time}.
 
-Classify the message and extract structured data.
+The message may contain ONE or MULTIPLE tasks/events (separated by newlines or listed together).
+Extract ALL actionable items from the message.
 
-Rules:
-- "task" = something to do without a specific time (e.g. "לקנות חלב", "להתקשר לאמא")
+Rules per item:
+- "task" = something to do without a specific time (e.g. "לקנות חלב")
   → date = today unless "מחר" (tomorrow) or a specific date is mentioned
   → start_time = null, end_time = null
-- "event" = meeting or appointment with a specific time (e.g. "פגישה מחר ב-15:00")
-  → extract date and time precisely
-  → if no end time given, assume 1 hour duration
-- "ignore" = greeting, question, command (starts with /), or not actionable
+- "event" = has a specific time (e.g. "אימון בשעה 6 בבוקר")
+  → extract date and time precisely; if no end time, assume 1 hour
+- "ignore" = greeting, question, or not actionable
 
-Respond with ONLY valid JSON:
-{{
-  "type": "task|event|ignore",
-  "title": "short Hebrew title",
-  "date": "DD/MM/YYYY",
-  "start_time": "HH:MM or null",
-  "end_time": "HH:MM or null",
-  "notes": "any extra details or empty string"
-}}
+Respond with ONLY a valid JSON array (even for a single item):
+[
+  {{
+    "type": "task|event|ignore",
+    "title": "short Hebrew title",
+    "date": "DD/MM/YYYY",
+    "start_time": "HH:MM or null",
+    "end_time": "HH:MM or null"
+  }}
+]
 
-Message: "{message}"
+Message:
+{message}
 """
 
 
@@ -87,7 +89,8 @@ def send_telegram(text: str):
 
 # ── GPT-4o Parsing ────────────────────────────────────────────────────────────
 
-def parse_message(text: str) -> dict:
+def parse_message(text: str) -> list[dict]:
+    """Returns a list of parsed items from a single Telegram message."""
     now = datetime.now(ISRAEL_TZ)
     prompt = PARSE_PROMPT.format(
         today=now.strftime("%d/%m/%Y"),
@@ -97,12 +100,13 @@ def parse_message(text: str) -> dict:
     response = openai_client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=256,
+        max_tokens=512,
         temperature=0.1,
     )
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
-    return json.loads(raw)
+    result = json.loads(raw)
+    return result if isinstance(result, list) else [result]
 
 
 # ── Google Calendar ───────────────────────────────────────────────────────────
@@ -186,54 +190,58 @@ def main():
 
         logger.info(f"Processing: {text!r}")
         try:
-            parsed = parse_message(text)
-            if parsed["type"] == "ignore":
-                ignored.append(text)
-                continue
-
-            service = _get_calendar_service()
-            date_iso = _parse_date(parsed["date"])
-
-            if parsed["type"] == "task" or not parsed.get("start_time"):
-                event_body = {
-                    "summary": f"📌 {parsed['title']}",
-                    "description": parsed.get("notes", ""),
-                    "start": {"date": date_iso},
-                    "end": {"date": date_iso},
-                }
-                when = f"{parsed['date']} — כל היום"
-                icon = "📌"
-            else:
-                start_dt = ISRAEL_TZ.localize(
-                    datetime.strptime(f"{date_iso} {parsed['start_time']}", "%Y-%m-%d %H:%M")
-                )
-                end_dt = (
-                    ISRAEL_TZ.localize(
-                        datetime.strptime(f"{date_iso} {parsed['end_time']}", "%Y-%m-%d %H:%M")
-                    )
-                    if parsed.get("end_time")
-                    else start_dt + timedelta(hours=1)
-                )
-                event_body = {
-                    "summary": f"📅 {parsed['title']}",
-                    "description": parsed.get("notes", ""),
-                    "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Jerusalem"},
-                    "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Jerusalem"},
-                    "reminders": {
-                        "useDefault": False,
-                        "overrides": [{"method": "popup", "minutes": 30}],
-                    },
-                }
-                when = f"{parsed['date']} {parsed['start_time']}–{end_dt.strftime('%H:%M')}"
-                icon = "📅"
-
-            service.events().insert(calendarId="primary", body=event_body).execute()
-            added.append(f'{icon} "{parsed["title"]}" — {when}')
-            logger.info(f"Added: {parsed['title']}")
-
+            items = parse_message(text)
         except Exception as e:
-            logger.error(f"Failed: {e}")
-            failed.append(f'• "{text[:50]}" — שגיאה')
+            logger.error(f"Parse failed: {e}")
+            failed.append(f'• "{text[:40]}" — שגיאת ניתוח: {e}')
+            continue
+
+        for parsed in items:
+            if parsed.get("type") == "ignore":
+                ignored.append(parsed.get("title", text))
+                continue
+            try:
+                service = _get_calendar_service()
+                date_iso = _parse_date(parsed["date"])
+
+                if parsed["type"] == "task" or not parsed.get("start_time"):
+                    event_body = {
+                        "summary": f"📌 {parsed['title']}",
+                        "start": {"date": date_iso},
+                        "end": {"date": date_iso},
+                    }
+                    when = f"{parsed['date']} — כל היום"
+                    icon = "📌"
+                else:
+                    start_dt = ISRAEL_TZ.localize(
+                        datetime.strptime(f"{date_iso} {parsed['start_time']}", "%Y-%m-%d %H:%M")
+                    )
+                    end_dt = (
+                        ISRAEL_TZ.localize(
+                            datetime.strptime(f"{date_iso} {parsed['end_time']}", "%Y-%m-%d %H:%M")
+                        )
+                        if parsed.get("end_time")
+                        else start_dt + timedelta(hours=1)
+                    )
+                    event_body = {
+                        "summary": f"📅 {parsed['title']}",
+                        "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Jerusalem"},
+                        "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Jerusalem"},
+                        "reminders": {
+                            "useDefault": False,
+                            "overrides": [{"method": "popup", "minutes": 30}],
+                        },
+                    }
+                    when = f"{parsed['date']} {parsed['start_time']}–{end_dt.strftime('%H:%M')}"
+                    icon = "📅"
+
+                service.events().insert(calendarId="primary", body=event_body).execute()
+                added.append(f'{icon} "{parsed["title"]}" — {when}')
+                logger.info(f"Added: {parsed['title']}")
+
+            except Exception as e:
+                logger.error(f"Calendar insert failed for {parsed.get('title')}: {e}")
+                failed.append(f'• "{parsed.get("title", "?")}": {str(e)[:80]}')
 
     acknowledge_updates(updates[-1]["update_id"])
 
