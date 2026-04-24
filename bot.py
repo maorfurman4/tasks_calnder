@@ -9,7 +9,8 @@ Runs for 25 minutes then exits (scheduled every 30 min via GitHub Actions).
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
+import signal
+import threading
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -33,6 +34,7 @@ RUN_DURATION_SECONDS = 25 * 60  # 25 minutes
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /start from chat_id={update.effective_chat.id}")
     await update.message.reply_text(
         "שלום! אני הבוט של מאור לסידור עבודה 💼\n\n"
         "שלח לי את הסידור עבודה כ-📎 קובץ (לא תמונה!) לאיכות מיטבית.\n"
@@ -42,15 +44,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    logger.info(f"Received photo/document from chat_id={chat_id}")
     await update.message.reply_text("מעבד את הסידור... ⏳")
 
     try:
         if update.message.document:
+            logger.info(f"Processing as document: {update.message.document.file_name}")
             file = await context.bot.get_file(update.message.document.file_id)
         else:
+            logger.info("Processing as photo")
             photo = update.message.photo[-1]
             file = await context.bot.get_file(photo.file_id)
+
         image_bytes = await file.download_as_bytearray()
+        logger.info(f"Downloaded image: {len(image_bytes)} bytes")
 
         shifts = parse_schedule_image(bytes(image_bytes))
 
@@ -83,22 +90,34 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"שגיאה בעיבוד התמונה: {e}\nנסה שנית.")
 
 
-async def shutdown_after(app: Application, seconds: int):
-    await asyncio.sleep(seconds)
-    logger.info("Run duration reached, shutting down.")
-    await app.stop()
-    await app.shutdown()
+async def handle_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catch-all handler for debugging — logs every incoming update."""
+    logger.info(f"Received update type: {update.effective_message.content_type if update.effective_message else 'unknown'} from chat_id={update.effective_chat.id if update.effective_chat else 'unknown'}")
+
+
+def _stop_bot_after(app: Application, seconds: int):
+    """Sends SIGINT after `seconds` to gracefully stop the polling loop."""
+    def _do_stop():
+        import time
+        time.sleep(seconds)
+        logger.info("Run duration reached, sending shutdown signal.")
+        os.kill(os.getpid(), signal.SIGINT)
+    t = threading.Thread(target=_do_stop, daemon=True)
+    t.start()
 
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
+    app.add_handler(MessageHandler(filters.ALL, handle_any))
 
-    async def post_init(application: Application):
-        asyncio.create_task(shutdown_after(application, RUN_DURATION_SECONDS))
-
-    app.post_init = post_init
+    _stop_bot_after(app, RUN_DURATION_SECONDS)
 
     logger.info("Bot started, will run for 25 minutes.")
     app.run_polling(
