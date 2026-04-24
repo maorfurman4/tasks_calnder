@@ -16,6 +16,7 @@ import requests
 from openai import OpenAI
 from google.oauth2.service_account import Credentials as SACredentials
 from google.oauth2.credentials import Credentials as OAuthCredentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -147,6 +148,8 @@ def _tasks_service():
         token_uri="https://oauth2.googleapis.com/token",
         scopes=["https://www.googleapis.com/auth/tasks"],
     )
+    creds.refresh(Request())
+    logger.info("Google Tasks token refreshed OK")
     return build("tasks", "v1", credentials=creds)
 
 
