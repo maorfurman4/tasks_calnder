@@ -2,8 +2,8 @@ name: Task & Calendar Sync
 
 on:
   schedule:
-    - cron: "0 7 * * *"    # 10:00 Israel time
-    - cron: "0 19 * * *"   # 22:00 Israel time
+    - cron: "0 5 * * *"    # 10:00 Israel time
+    - cron: "0 17 * * *"   # 22:00 Israel time
   workflow_dispatch:
 
 jobs:
@@ -30,7 +30,5 @@ jobs:
           OPEN_API_KEY: ${{ secrets.OPEN_API_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_CALENDAR_ID: maorfurman123@gmail.com
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_TASKS_REFRESH_TOKEN: ${{ secrets.GOOGLE_TASKS_REFRESH_TOKEN }}
+          GOOGLE_TASKS_CREDENTIALS: ${{ secrets.GOOGLE_TASKS_CREDENTIALS }}
         run: python task_sync.py
